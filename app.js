@@ -5,7 +5,7 @@ const DAY = 86400000;
 const INTERVALS = [0, 1, 2, 4, 7, 14, 30, 60];   // days per box
 const MASTERED_BOX = 4;
 const SESSION_SIZE = 12;
-const LEVEL_NAMES = ['מילות קישור', 'אקדמי', 'מתקדם'];
+const LEVEL_NAMES = ['מילות קישור · בישיבות', 'אקדמי', 'מתקדם'];
 const POS_NAMES = {c:'מילת קישור', n:'שם עצם', v:'פועל', a:'תואר', d:'תואר הפועל'};
 
 const W = WORDS.map(([en, he, lvl, pos], i) => ({id: en, en, he, lvl, pos, i}));
@@ -29,9 +29,12 @@ function dueCards(now = Date.now()){
 const FAMILY_OF = {};
 Object.entries(typeof FAMILIES === 'undefined' ? {} : FAMILIES).forEach(([f, ws]) => ws.forEach(w => FAMILY_OF[w] = f));
 const NOTE = typeof NOTES === 'undefined' ? {} : NOTES;
+const NEAR = {};
+(typeof SIMILAR === 'undefined' ? [] : SIMILAR).forEach(g => g.forEach(x => { (NEAR[x] ||= new Set()); g.forEach(y => { if (y !== x) NEAR[x].add(y); }); }));
 // New words are interleaved: about one connector for every two academic words.
 // Words from the same meaning family are never introduced on the same day (they interfere).
-const MIX = [1, 1, 0, 1, 1, 0];
+// connectors are taught in the live sessions, so the app no longer introduces new ones
+const MIX = [1, 1, 1, 1, 1, 2];
 function newCandidates(){
   const usedFam = new Set(dayRec().fams || []);
   const left = {0: [], 1: [], 2: []};
@@ -40,10 +43,11 @@ function newCandidates(){
   W.filter(w => !S.cards[w.id]).sort((a,b) => a.lvl === 0 ? a.i - b.i : h(a.id) - h(b.id)).forEach(w => left[w.lvl].push(w));
   const out = [];
   let k = 0, guard = 0;
-  while (guard++ < 2000 && (left[0].length || left[1].length || left[2].length)){
+  while (guard++ < 2000 && (left[1].length || left[2].length)){
     let lvl = MIX[k++ % MIX.length];
     if (lvl === 1 && !left[1].length) lvl = 2;
-    if (!left[lvl].length) lvl = [1,2,0].find(l => left[l].length);
+    if (!left[lvl].length) lvl = [1,2].find(l => left[l].length);
+    if (lvl === undefined) break;
     if (lvl === 0){
       const idx = left[0].findIndex(w => !usedFam.has(FAMILY_OF[w.id]));
       if (idx < 0){ left[0] = []; continue; }
@@ -179,8 +183,10 @@ function session(items){
     const toks = s => s.split(/[\s,;]+/).filter(t => t.length >= 3);
     const wt = new Set(toks(w.he));
     const pool = W.filter(x => x.id !== id && x.pos === w.pos && !toks(x.he).some(t => wt.has(t)));
-    const near = shuffle(pool.filter(x => x.lvl === w.lvl)).slice(0, 3);
-    const distract = near.length >= 3 ? near : shuffle(pool).slice(0, 3);
+    // wrong options mirror the exam: same part of speech, unrelated meanings.
+    // connectors never get options from their own meaning family.
+    const far = pool.filter(x => (!FAMILY_OF[w.id] || FAMILY_OF[x.id] !== FAMILY_OF[w.id]) && !(NEAR[w.id] && NEAR[w.id].has(x.id)));
+    const distract = shuffle(far.length >= 3 ? far : pool).slice(0, 3);
     const opts = shuffle([w, ...distract]);
     const t0 = performance.now();
     app.innerHTML = `
@@ -310,7 +316,7 @@ function settings(){
   };
 }
 
-const APP_VERSION = 3;
+const APP_VERSION = 4;
 if ('serviceWorker' in navigator){
   // check for a new version on every open; when it takes over, reload once so the new files are used
   navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => r.update()).catch(() => {});
