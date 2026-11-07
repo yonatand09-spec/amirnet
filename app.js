@@ -26,9 +26,31 @@ function dueCards(now = Date.now()){
   return Object.entries(S.cards).filter(([id,c]) => byId[id] && c.due <= now).map(([id]) => id)
     .sort((a,b) => S.cards[a].due - S.cards[b].due);
 }
+const FAMILY_OF = {};
+Object.entries(typeof FAMILIES === 'undefined' ? {} : FAMILIES).forEach(([f, ws]) => ws.forEach(w => FAMILY_OF[w] = f));
+const NOTE = typeof NOTES === 'undefined' ? {} : NOTES;
+// New words are interleaved: about one connector for every two academic words.
+// Words from the same meaning family are never introduced on the same day (they interfere).
+const MIX = [1, 1, 0, 1, 1, 0];
 function newCandidates(){
-  // connectors first, then core, then advanced; inside a level keep list order
-  return W.filter(w => !S.cards[w.id]).sort((a,b) => a.lvl - b.lvl || a.i - b.i).map(w => w.id);
+  const usedFam = new Set(dayRec().fams || []);
+  const left = {0: [], 1: [], 2: []};
+  // academic words come in a fixed scrambled order, so related words written next to each other in the list are spread apart
+  const h = str => { let x = 2166136261; for (const ch of str){ x ^= ch.charCodeAt(0); x = Math.imul(x, 16777619); } return x >>> 0; };
+  W.filter(w => !S.cards[w.id]).sort((a,b) => a.lvl === 0 ? a.i - b.i : h(a.id) - h(b.id)).forEach(w => left[w.lvl].push(w));
+  const out = [];
+  let k = 0, guard = 0;
+  while (guard++ < 2000 && (left[0].length || left[1].length || left[2].length)){
+    let lvl = MIX[k++ % MIX.length];
+    if (lvl === 1 && !left[1].length) lvl = 2;
+    if (!left[lvl].length) lvl = [1,2,0].find(l => left[l].length);
+    if (lvl === 0){
+      const idx = left[0].findIndex(w => !usedFam.has(FAMILY_OF[w.id]));
+      if (idx < 0){ left[0] = []; continue; }
+      const w = left[0].splice(idx, 1)[0]; usedFam.add(FAMILY_OF[w.id]); out.push(w.id);
+    } else out.push(left[lvl].shift().id);
+  }
+  return out;
 }
 function newLeftToday(){ return Math.max(0, S.settings.dailyNew - dayRec().newWords); }
 function buildSession(){
@@ -45,10 +67,16 @@ function buildSession(){
   return ids;
 }
 function grade(id, ok, ms, mode){
-  if (!S.cards[id]) dayRec().newWords++;
+  if (!S.cards[id]){ const d = dayRec(); d.newWords++; if (FAMILY_OF[id]) (d.fams ||= []).push(FAMILY_OF[id]); }
   const c = S.cards[id] ||= {box:0, due:0, seen:0, right:0, wrong:0, first:Date.now()};
   c.seen++; c.lastMs = ms;
-  if (ok){ c.right++; c.box = Math.min(c.box + 1, INTERVALS.length - 1); c.due = Date.now() + INTERVALS[c.box]*DAY - 3600000; }
+  const SLOW_MS = mode === 'type' ? 15000 : 8000;
+  if (ok){
+    c.right++;
+    // a slow correct answer is treated as shaky: the word stays at its level instead of moving up
+    if (ms < SLOW_MS || c.box === 0) c.box = Math.min(c.box + 1, INTERVALS.length - 1);
+    c.due = Date.now() + Math.max(INTERVALS[c.box], ms < SLOW_MS ? 0 : 1)*DAY - 3600000;
+  }
   else { c.wrong++; c.box = 1; c.due = Date.now() + 10*60000; }
   const d = dayRec(); d.reviews++; if (ok) d.correct++; d.ms += ms;
   touchStreak();
@@ -144,7 +172,9 @@ function session(items){
     const w = byId[id];
     const c = S.cards[id];
     // new and weak words: English to Hebrew; stronger words: also Hebrew to English
-    const mode = (isNew || !c || c.box < 2 || Math.random() < 0.5) ? 'en2he' : 'he2en';
+    // well-known words: produce the English yourself (recall beats recognition)
+    const mode = (isNew || !c || c.box < 2) ? 'en2he' : (c.box >= 3 && Math.random() < 0.5) ? 'type' : (Math.random() < 0.5 ? 'en2he' : 'he2en');
+    if (mode === 'type') return typeCard(w);
     // distractors must not share a meaning word with the answer (e.g. "למרות" vs "למרות ש")
     const toks = s => s.split(/[\s,;]+/).filter(t => t.length >= 3);
     const wt = new Set(toks(w.he));
@@ -161,24 +191,58 @@ function session(items){
         ${mode === 'en2he' ? `<div class="prompt-en">${esc(w.en)}</div>` : `<div class="prompt-he">${esc(w.he)}</div>`}
         <div class="hint">${POS_NAMES[w.pos]}</div>
       </div>
-      <div class="opts">${opts.map((o,k) => `<button class="opt ${mode === 'he2en' ? 'en' : ''}" data-id="${esc(o.id)}"><span class="k">${k+1}</span><span>${esc(mode === 'en2he' ? o.he : o.en)}</span></button>`).join('')}</div>
+      <div class="opts">${opts.map((o,k) => `<button class="opt ${mode === 'he2en' ? 'en' : ''}" data-id="${esc(o.id)}"><span class="k">${k+1}</span><span>${esc(mode === 'en2he' ? o.he : o.en)}</span></button>`).join('')}
+        <button class="opt idk" data-id="__idk__"><span class="k">?</span><span>לא יודע</span></button></div>
       <div class="feedback" id="fb"></div>`;
     document.getElementById('quit').onclick = () => { sync(); home(); };
     app.querySelectorAll('.opt').forEach(b => b.onclick = () => {
       const ms = Math.round(performance.now() - t0);
-      const ok = b.dataset.id === id;
+      const ok = b.dataset.id === id;   // "לא יודע" counts as a miss, so a lucky guess never locks a word
       app.querySelectorAll('.opt').forEach(x => { x.disabled = true; if (x.dataset.id === id) x.classList.add('right'); });
-      if (!ok) b.classList.add('wrong');
+      if (!ok && b.dataset.id !== '__idk__') b.classList.add('wrong');
       grade(id, ok, ms, mode);
       results.push(ok);
       if (!ok) items.push({id, isNew:false});   // see it again before the session ends
-      const fb = document.getElementById('fb');
-      if (ok){ setTimeout(() => { i++; show(); }, 650); }
-      else {
-        fb.innerHTML = `<button class="btn primary" id="next">${esc(w.en)} = ${esc(w.he)} · המשך</button>`;
-        document.getElementById('next').onclick = () => { i++; show(); };
-      }
+      after(w, ok);
     });
+  };
+  // shared feedback: correct answers move on quickly unless there is a usage note worth reading
+  const after = (w, ok) => {
+    const fb = document.getElementById('fb');
+    const note = NOTE[w.id] ? `<p class="note">${esc(NOTE[w.id])}</p>` : '';
+    if (ok && !note){ setTimeout(() => { i++; show(); }, 650); return; }
+    fb.innerHTML = `<div style="display:grid;gap:8px;width:100%">${note}<button class="btn primary" id="next">${ok ? 'המשך' : `${esc(w.en)} = ${esc(w.he)} · המשך`}</button></div>`;
+    const nx = document.getElementById('next'); nx.focus(); nx.onclick = () => { i++; show(); };
+  };
+  const typeCard = (w) => {
+    const t0 = performance.now();
+    const len = w.en.replace(/[^a-z]/gi, '').length;
+    app.innerHTML = `
+      <div class="top"><button class="icon-btn" id="quit">יציאה</button><span class="muted">${i+1}/${items.length}</span></div>
+      <div class="progress">${items.map((_,k) => `<i class="${k < i ? (results[k] ? 'ok' : 'no') : k === i ? 'cur' : ''}"></i>`).join('')}</div>
+      <div class="card">
+        <span class="pill" style="justify-self:center">כתוב באנגלית</span>
+        <div class="prompt-he">${esc(w.he)}</div>
+        <div class="hint">מתחילה ב־<b dir="ltr">${esc(w.en[0])}</b> · ${len} אותיות</div>
+      </div>
+      <form id="tf" class="opts" autocomplete="off">
+        <input id="ans" dir="ltr" class="type-in" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="התשובה באנגלית">
+        <button class="btn primary" type="submit">בדוק</button>
+      </form>
+      <div class="feedback" id="fb"></div>`;
+    document.getElementById('quit').onclick = () => { sync(); home(); };
+    const inp = document.getElementById('ans'); inp.focus();
+    document.getElementById('tf').onsubmit = (e) => {
+      e.preventDefault();
+      if (inp.disabled) return;
+      const norm = s => s.toLowerCase().replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
+      const ok = norm(inp.value) === norm(w.en);
+      const ms = Math.round(performance.now() - t0);
+      inp.disabled = true; inp.classList.add(ok ? 'right' : 'wrong');
+      grade(w.id, ok, ms, 'type'); results.push(ok);
+      if (!ok) items.push({id: w.id, isNew: false});
+      after(w, ok);
+    };
   };
   const finish = () => {
     const ok = results.filter(Boolean).length;

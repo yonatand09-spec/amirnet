@@ -1,5 +1,5 @@
 // Offline-first cache. Bump VERSION when files change.
-const VERSION = 'amirnet-v1';
+const VERSION = 'amirnet-v2';
 const SHELL = ['./', 'index.html', 'app.js', 'words.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== VERSION).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
