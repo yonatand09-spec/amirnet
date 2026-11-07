@@ -157,7 +157,7 @@ function home(){
       </div>
       <button class="btn" id="listBtn">כל המילים</button>
     </section>
-    <div class="row">${syncLine}</div>`;
+    <div class="row" style="justify-content:space-between">${syncLine}<span class="sync muted">גרסה ${APP_VERSION}</span></div>`;
   document.getElementById('go').onclick = () => session(ses);
   document.getElementById('setBtn').onclick = settings;
   document.getElementById('listBtn').onclick = wordList;
@@ -310,7 +310,13 @@ function settings(){
   };
 }
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+const APP_VERSION = 3;
+if ('serviceWorker' in navigator){
+  // check for a new version on every open; when it takes over, reload once so the new files are used
+  navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => r.update()).catch(() => {});
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloaded && !app.querySelector('.card')){ reloaded = true; location.reload(); } });
+}
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible'){ sync(); if (!app.querySelector('.card')) home(); } });
 home();
 sync();
