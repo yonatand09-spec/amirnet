@@ -23,7 +23,8 @@ function dayRec(d = today()){ return S.days[d] ||= {reviews:0, correct:0, newWor
 
 /* ---------- scheduling ---------- */
 function dueCards(now = Date.now()){
-  return Object.entries(S.cards).filter(([id,c]) => byId[id] && c.due <= now).map(([id]) => id)
+  // connectors are taught only in the live sessions: they never come up in the app, not even for review
+  return Object.entries(S.cards).filter(([id,c]) => byId[id] && byId[id].lvl !== 0 && c.due <= now).map(([id]) => id)
     .sort((a,b) => S.cards[a].due - S.cards[b].due);
 }
 const FAMILY_OF = {};
@@ -155,7 +156,7 @@ function home(){
     </section>
     <section class="panel">
       <h2>התקדמות לפי רמה</h2>
-      <div class="levels">${st.levels.map((l,i) => `
+      <div class="levels">${st.levels.map((l,i) => i === 0 ? '' : `
         <div class="lv"><div class="head"><span>${LEVEL_NAMES[i]}</span><span class="muted">${l.mastered}/${l.total}${l.acc != null ? ' · דיוק ' + l.acc + '%' : ''}</span></div>
         <div class="bar"><span class="m" style="width:${100*l.mastered/l.total}%"></span><span class="s" style="width:${100*(l.started-l.mastered)/l.total}%"></span></div></div>`).join('')}
       </div>
@@ -316,7 +317,7 @@ function settings(){
   };
 }
 
-const APP_VERSION = 4;
+const APP_VERSION = 5;
 if ('serviceWorker' in navigator){
   // check for a new version on every open; when it takes over, reload once so the new files are used
   navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => r.update()).catch(() => {});
