@@ -24,69 +24,89 @@ function dayRec(d = today()){ return S.days[d] ||= {reviews:0, correct:0, newWor
 /* ---------- scheduling ---------- */
 function dueCards(now = Date.now()){
   // connectors are taught only in the live sessions: they never come up in the app, not even for review
-  return Object.entries(S.cards).filter(([id,c]) => byId[id] && byId[id].lvl !== 0 && c.due <= now).map(([id]) => id)
+  const sweep = now >= SWEEP_START;
+  return Object.entries(S.cards).filter(([id,c]) => byId[id] && byId[id].lvl !== 0 && (c.due <= now || (sweep && !(c.learn > 0) && (c.last || 0) < SWEEP_START))).map(([id]) => id)
     .sort((a,b) => S.cards[a].due - S.cards[b].due);
 }
 const FAMILY_OF = {};
 Object.entries(typeof FAMILIES === 'undefined' ? {} : FAMILIES).forEach(([f, ws]) => ws.forEach(w => FAMILY_OF[w] = f));
 const NOTE = typeof NOTES === 'undefined' ? {} : NOTES;
+const CLOZES = typeof CLOZE === 'undefined' ? {} : CLOZE;
 const NEAR = {};
 (typeof SIMILAR === 'undefined' ? [] : SIMILAR).forEach(g => g.forEach(x => { (NEAR[x] ||= new Set()); g.forEach(y => { if (y !== x) NEAR[x].add(y); }); }));
-// New words are interleaved: about one connector for every two academic words.
-// Words from the same meaning family are never introduced on the same day (they interfere).
-// connectors are taught in the live sessions, so the app no longer introduces new ones
-const MIX = [1, 1, 1, 1, 1, 2];
+// New words follow ORDER: question language and words that recur in past exams first, then mid-frequency academic words, rare words last.
+// Two words from the same close-meaning group are never introduced on the same day (they interfere).
+const GROUP_OF = {};
+(typeof SIMILAR === 'undefined' ? [] : SIMILAR).forEach((g, gi) => g.forEach(x => { (GROUP_OF[x] ||= []).push(gi); }));
+const ORDERED = (typeof ORDER === 'undefined' ? W.map(w => w.id) : ORDER).filter(id => byId[id] && byId[id].lvl !== 0);
 function newCandidates(){
-  const usedFam = new Set(dayRec().fams || []);
-  const left = {0: [], 1: [], 2: []};
-  // academic words come in a fixed scrambled order, so related words written next to each other in the list are spread apart
-  const h = str => { let x = 2166136261; for (const ch of str){ x ^= ch.charCodeAt(0); x = Math.imul(x, 16777619); } return x >>> 0; };
-  W.filter(w => !S.cards[w.id]).sort((a,b) => a.lvl === 0 ? a.i - b.i : h(a.id) - h(b.id)).forEach(w => left[w.lvl].push(w));
+  const used = new Set(dayRec().grps || []);
   const out = [];
-  let k = 0, guard = 0;
-  while (guard++ < 2000 && (left[1].length || left[2].length)){
-    let lvl = MIX[k++ % MIX.length];
-    if (lvl === 1 && !left[1].length) lvl = 2;
-    if (!left[lvl].length) lvl = [1,2].find(l => left[l].length);
-    if (lvl === undefined) break;
-    if (lvl === 0){
-      const idx = left[0].findIndex(w => !usedFam.has(FAMILY_OF[w.id]));
-      if (idx < 0){ left[0] = []; continue; }
-      const w = left[0].splice(idx, 1)[0]; usedFam.add(FAMILY_OF[w.id]); out.push(w.id);
-    } else out.push(left[lvl].shift().id);
+  for (const id of ORDERED){
+    if (S.cards[id]) continue;
+    const gs = GROUP_OF[id] || [];
+    if (gs.some(g => used.has(g))) continue;
+    gs.forEach(g => used.add(g));
+    out.push(id);
   }
   return out;
 }
-function newLeftToday(){ return Math.max(0, S.settings.dailyNew - dayRec().newWords); }
+function newLeftToday(){ const d = dayRec(); return Math.max(0, S.settings.dailyNew + (d.extraNew || 0) - d.newWords); }
 function buildSession(){
   const due = dueCards();
   const fresh = newCandidates().slice(0, newLeftToday());
   const ids = [];
-  // mix: up to SESSION_SIZE, reviews first priority, new words interleaved (1 new per 2 reviews)
+  // reviews first, new words interleaved (1 new per 2 reviews)
   let di = 0, ni = 0;
   while (ids.length < SESSION_SIZE && (di < due.length || ni < fresh.length)){
     if (di < due.length) ids.push({id: due[di++], isNew:false});
     if (ids.length < SESSION_SIZE && di < due.length) ids.push({id: due[di++], isNew:false});
-    if (ids.length < SESSION_SIZE && ni < fresh.length) ids.push({id: fresh[ni++], isNew:true});
+    if (ids.length < SESSION_SIZE && ni < Math.min(fresh.length, NEW_PER_SESSION)) ids.push({id: fresh[ni++], isNew:true});
+    if (di >= due.length && ni >= Math.min(fresh.length, NEW_PER_SESSION)) break;
   }
   return ids;
 }
-function grade(id, ok, ms, mode){
-  if (!S.cards[id]){ const d = dayRec(); d.newWords++; if (FAMILY_OF[id]) (d.fams ||= []).push(FAMILY_OF[id]); }
-  const c = S.cards[id] ||= {box:0, due:0, seen:0, right:0, wrong:0, first:Date.now()};
+// Successive relearning: a word counts as learned only after several correct recalls spread through the session.
+// New word: 3 correct answers. After a miss: 2 more correct answers, and the word drops back to the start of the schedule.
+// Exam-aware schedule: no review is pushed past 17.12, and from 13.12 every word gets one last review.
+const CAP = new Date('2026-12-17T20:00:00+02:00').getTime();
+const SWEEP_START = new Date('2026-12-13T00:00:00+02:00').getTime();
+const LEARN_NEW = 3, LEARN_AFTER_MISS = 2, NEW_PER_SESSION = 5;
+function grade(id, ok, ms, mode, practice){
+  if (!S.cards[id]){ const d = dayRec(); d.newWords++; (d.grps ||= []).push(...(GROUP_OF[id] || [])); }
+  const c = S.cards[id] ||= {box:0, due:0, seen:0, right:0, wrong:0, learn:LEARN_NEW, first:Date.now()};
+  c.learn ||= 0;
   c.seen++; c.lastMs = ms;
-  const SLOW_MS = mode === 'type' ? 15000 : 8000;
-  if (ok){
-    c.right++;
-    // a slow correct answer is treated as shaky: the word stays at its level instead of moving up
-    if (ms < SLOW_MS || c.box === 0) c.box = Math.min(c.box + 1, INTERVALS.length - 1);
-    c.due = Date.now() + Math.max(INTERVALS[c.box], ms < SLOW_MS ? 0 : 1)*DAY - 3600000;
+  const SLOW_MS = mode.startsWith('type') ? 15000 : mode.startsWith('cloze') ? 20000 : 8000;
+  if (ok) c.right++; else c.wrong++;
+  if (practice){
+    // free practice never moves a word up; a miss sends it back to learning
+    if (!ok){ c.box = Math.min(c.box, 1); c.learn = Math.max(c.learn, LEARN_AFTER_MISS); c.due = Date.now(); }
+  } else if (c.learn > 0){
+    if (ok){
+      c.learn--;
+      if (c.learn === 0){ c.box = 1; c.due = Date.now() + INTERVALS[1]*DAY - 3600000; }   // learned: next check tomorrow
+      else c.due = Date.now();                                                         // still learning: comes back in this session
+    } else { c.learn = Math.max(c.learn, LEARN_AFTER_MISS); c.due = Date.now(); }
+  } else {
+    if (ok){
+      // a slow correct answer is treated as shaky: the word stays at its level instead of moving up
+      if (ms < SLOW_MS) c.box = Math.min(c.box + 1, INTERVALS.length - 1);
+      c.due = Date.now() + Math.max(INTERVALS[c.box], 1)*DAY - 3600000;
+    } else { c.box = 1; c.learn = LEARN_AFTER_MISS; c.due = Date.now(); }
   }
-  else { c.wrong++; c.box = 1; c.due = Date.now() + 10*60000; }
+  c.last = Date.now();
+  if (Date.now() < CAP && c.due > CAP) c.due = CAP;
   const d = dayRec(); d.reviews++; if (ok) d.correct++; d.ms += ms;
   touchStreak();
-  S.queue.push({t:new Date().toISOString(), word:id, ok:ok?1:0, ms, mode, box:c.box, lvl:byId[id].lvl, dev:S.device});
+  S.queue.push({t:new Date().toISOString(), word:id, ok:ok?1:0, ms, mode: practice ? 'practice-' + mode : mode, box:c.box, lvl:byId[id].lvl, dev:S.device});
   save();
+  return c.learn > 0;   // true: show it again later in this session
+}
+function practiceSet(){
+  // words still settling (learned in the last days or not yet locked), weakest first
+  return shuffle(Object.entries(S.cards).filter(([id,c]) => byId[id] && byId[id].lvl !== 0 && c.box < MASTERED_BOX)
+    .sort((a,b) => (a[1].right/a[1].seen) - (b[1].right/b[1].seen)).slice(0, 30)).slice(0, SESSION_SIZE).map(([id]) => ({id, isNew:false}));
 }
 function touchStreak(){ S.lastStudy = today(); }
 function streak(){
@@ -144,7 +164,7 @@ function home(){
   app.innerHTML = `
     <div class="top"><h1>אמירנט</h1><button class="icon-btn" id="setBtn">הגדרות</button></div>
     <p class="muted">${examDays > 0 ? `עוד ${examDays} ימים לבחינה` : 'יום הבחינה'} · רצף של ${st.streak} ${st.streak === 1 ? 'יום' : 'ימים'}</p>
-    <button class="big-btn" id="go" ${ses.length ? '' : 'disabled'}>${ses.length ? `התחל · ${ses.length} כרטיסים` : 'אין כרגע מה לחזור, כל הכבוד'}</button>
+    ${ses.length ? `<button class="big-btn" id="go">התחל · ${ses.length} מילים</button>` : '<p class="muted" id="doneNote">סיימת את מה שמתוכנן להיום. אפשר להמשיך:</p>'}
     <section class="panel">
       <div class="stats">
         <div class="stat"><span class="n">${st.mastered}</span><span class="l">מילים שננעלו</span></div>
@@ -160,15 +180,17 @@ function home(){
         <div class="lv"><div class="head"><span>${LEVEL_NAMES[i]}</span><span class="muted">${l.mastered}/${l.total}${l.acc != null ? ' · דיוק ' + l.acc + '%' : ''}</span></div>
         <div class="bar"><span class="m" style="width:${100*l.mastered/l.total}%"></span><span class="s" style="width:${100*(l.started-l.mastered)/l.total}%"></span></div></div>`).join('')}
       </div>
-      <button class="btn" id="listBtn">כל המילים</button>
+      <div class="row">${stubborn().length ? `<button class="btn" id="stubBtn">מילים עקשניות · ${stubborn().length}</button>` : ''}<button class="btn" id="listBtn">כל המילים</button></div>
     </section>
     <div class="row" style="justify-content:space-between">${syncLine}<span class="sync muted">גרסה ${APP_VERSION}</span></div>`;
-  document.getElementById('go').onclick = () => session(ses);
+  if (ses.length) document.getElementById('go').onclick = () => session(ses);
+  else moreButtons(document.getElementById('doneNote'));
   document.getElementById('setBtn').onclick = settings;
   document.getElementById('listBtn').onclick = wordList;
+  const sb = document.getElementById('stubBtn'); if (sb) sb.onclick = stubbornList;
 }
 
-function session(items){
+function session(items, practice = false){
   const results = [];
   let i = 0;
   const show = () => {
@@ -178,7 +200,11 @@ function session(items){
     const c = S.cards[id];
     // new and weak words: English to Hebrew; stronger words: also Hebrew to English
     // well-known words: produce the English yourself (recall beats recognition)
-    const mode = (isNew || !c || c.box < 2) ? 'en2he' : (c.box >= 3 && Math.random() < 0.5) ? 'type' : (Math.random() < 0.5 ? 'en2he' : 'he2en');
+    // a word still being learned alternates direction on its repeat appearances
+    const mode = (isNew || !c) ? 'en2he'
+      : (c.learn > 0 || c.box < 2) ? (c.seen % 2 ? 'he2en' : 'en2he')
+      : (CLOZES[id] && c.box >= 2 && Math.random() < 0.6) ? 'cloze'
+      : (c.box >= 3 && Math.random() < 0.5) ? 'type' : (Math.random() < 0.5 ? 'en2he' : 'he2en');
     if (mode === 'type') return typeCard(w);
     // distractors must not share a meaning word with the answer (e.g. "למרות" vs "למרות ש")
     const toks = s => s.split(/[\s,;]+/).filter(t => t.length >= 3);
@@ -195,10 +221,11 @@ function session(items){
       <div class="progress">${items.map((_,k) => `<i class="${k < i ? (results[k] ? 'ok' : 'no') : k === i ? 'cur' : ''}"></i>`).join('')}</div>
       <div class="card">
         ${isNew ? '<span class="pill" style="justify-self:center">מילה חדשה</span>' : ''}
-        ${mode === 'en2he' ? `<div class="prompt-en">${esc(w.en)}</div>` : `<div class="prompt-he">${esc(w.he)}</div>`}
-        <div class="hint">${POS_NAMES[w.pos]}</div>
+        ${mode === 'cloze' ? `<span class="pill" style="justify-self:center">השלמת משפט</span><div class="prompt-cloze">${esc(CLOZES[id]).replace('____', '<span class="blank">______</span>')}</div>`
+          : mode === 'en2he' ? `<div class="prompt-en">${esc(w.en)}</div>` : `<div class="prompt-he">${esc(w.he)}</div>`}
+        ${mode === 'cloze' ? '' : `<div class="hint">${POS_NAMES[w.pos]}</div>`}
       </div>
-      <div class="opts">${opts.map((o,k) => `<button class="opt ${mode === 'he2en' ? 'en' : ''}" data-id="${esc(o.id)}"><span class="k">${k+1}</span><span>${esc(mode === 'en2he' ? o.he : o.en)}</span></button>`).join('')}
+      <div class="opts">${opts.map((o,k) => `<button class="opt ${mode === 'en2he' ? '' : 'en'}" data-id="${esc(o.id)}"><span class="k">${k+1}</span><span>${esc(mode === 'en2he' ? o.he : o.en)}</span></button>`).join('')}
         <button class="opt idk" data-id="__idk__"><span class="k">?</span><span>לא יודע</span></button></div>
       <div class="feedback" id="fb"></div>`;
     document.getElementById('quit').onclick = () => { sync(); home(); };
@@ -207,11 +234,18 @@ function session(items){
       const ok = b.dataset.id === id;   // "לא יודע" counts as a miss, so a lucky guess never locks a word
       app.querySelectorAll('.opt').forEach(x => { x.disabled = true; if (x.dataset.id === id) x.classList.add('right'); });
       if (!ok && b.dataset.id !== '__idk__') b.classList.add('wrong');
-      grade(id, ok, ms, mode);
+      // a wrong pick is logged with the word it was confused with
+      const picked = ok ? mode : mode + '>' + (b.dataset.id === '__idk__' ? 'idk' : b.dataset.id);
+      requeue(id, grade(id, ok, ms, picked, practice), ok);
       results.push(ok);
-      if (!ok) items.push({id, isNew:false});   // see it again before the session ends
       after(w, ok);
     });
+  };
+  // a word that still needs correct answers comes back a few cards later (sooner after a miss)
+  const requeue = (id, again, ok) => {
+    if (!again) return;
+    const pos = Math.min(i + 1 + (ok ? 4 : 2), items.length);
+    items.splice(pos, 0, {id, isNew:false});
   };
   // shared feedback: correct answers move on quickly unless there is a usage note worth reading
   const after = (w, ok) => {
@@ -246,8 +280,7 @@ function session(items){
       const ok = norm(inp.value) === norm(w.en);
       const ms = Math.round(performance.now() - t0);
       inp.disabled = true; inp.classList.add(ok ? 'right' : 'wrong');
-      grade(w.id, ok, ms, 'type'); results.push(ok);
-      if (!ok) items.push({id: w.id, isNew: false});
+      requeue(w.id, grade(w.id, ok, ms, 'type', practice), ok); results.push(ok);
       after(w, ok);
     };
   };
@@ -264,11 +297,33 @@ function session(items){
       <button class="btn" id="back">למסך הבית</button>`;
     const next = buildSession();
     const again = document.getElementById('again');
-    if (!next.length){ again.disabled = true; again.textContent = 'סיימת את כל מה שמתוכנן להיום'; }
+    if (!next.length){ again.remove(); moreButtons(document.getElementById('back')); }
     else again.onclick = () => session(next);
     document.getElementById('back').onclick = home;
   };
   show();
+}
+
+// after the planned work: learn more new words, or practice words that are not locked yet
+function moreButtons(anchor){
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:grid;gap:10px';
+  const hasNew = newCandidates().length > 0;
+  const prac = practiceSet();
+  wrap.innerHTML = `${hasNew ? '<button class="big-btn" id="moreNew">עוד 10 מילים חדשות</button>' : ''}
+    ${prac.length ? `<button class="btn" id="freePrac">תרגול חופשי · ${prac.length} מילים שעוד לא ננעלו</button>` : ''}`;
+  anchor.after(wrap);
+  if (hasNew) wrap.querySelector('#moreNew').onclick = () => { const d = dayRec(); d.extraNew = (d.extraNew || 0) + 10; save(); session(buildSession()); };
+  if (prac.length) wrap.querySelector('#freePrac').onclick = () => session(prac, true);
+}
+
+// words missed 3 times or more: we build a memory image for them together in the sessions
+function stubborn(){ return Object.entries(S.cards).filter(([id,c]) => byId[id] && byId[id].lvl !== 0 && c.wrong >= 3 && c.box < MASTERED_BOX).sort((a,b) => b[1].wrong - a[1].wrong); }
+function stubbornList(){
+  const rows = stubborn().map(([id,c]) => `<div class="w"><span>${esc(byId[id].en)}</span><span>${esc(byId[id].he)} <span class="pill">${c.wrong} טעויות</span></span></div>`).join('');
+  app.innerHTML = `<div class="top"><h1>מילים עקשניות</h1><button class="icon-btn" id="back">חזרה</button></div>
+    <section class="panel"><p class="muted">מילים שטעית בהן 3 פעמים ומעלה. בישיבה נבנה לכל אחת תמונת זיכרון.</p><div class="list">${rows}</div></section>`;
+  document.getElementById('back').onclick = home;
 }
 
 function wordList(){
@@ -317,7 +372,7 @@ function settings(){
   };
 }
 
-const APP_VERSION = 5;
+const APP_VERSION = 6;
 if ('serviceWorker' in navigator){
   // check for a new version on every open; when it takes over, reload once so the new files are used
   navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => r.update()).catch(() => {});

@@ -1,5 +1,5 @@
 // Offline-first cache. Bump VERSION when files change.
-const VERSION = 'amirnet-v5';
+const VERSION = 'amirnet-v6';
 const SHELL = ['./', 'index.html', 'app.js', 'words.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 // 'reload' skips the browser's HTTP cache (GitHub Pages keeps files for 10 minutes),
 // so a new version never gets filled with the previous version's files.
