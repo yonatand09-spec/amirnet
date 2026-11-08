@@ -39,11 +39,14 @@ const NEAR = {};
 const GROUP_OF = {};
 (typeof SIMILAR === 'undefined' ? [] : SIMILAR).forEach((g, gi) => g.forEach(x => { (GROUP_OF[x] ||= []).push(gi); }));
 const ORDERED = (typeof ORDER === 'undefined' ? W.map(w => w.id) : ORDER).filter(id => byId[id] && byId[id].lvl !== 0);
-function newCandidates(){
-  const used = new Set(dayRec().grps || []);
+// next words from ORDER that are in no unit yet; never two words of one close-meaning group in the same unit
+function newCandidates(n, unitWords = []){
+  const taken = new Set(S.units.flatMap(u => u.words));
+  const used = new Set(unitWords.flatMap(id => GROUP_OF[id] || []));
   const out = [];
   for (const id of ORDERED){
-    if (S.cards[id]) continue;
+    if (out.length >= n) break;
+    if (S.cards[id] || taken.has(id)) continue;
     const gs = GROUP_OF[id] || [];
     if (gs.some(g => used.has(g))) continue;
     gs.forEach(g => used.add(g));
@@ -51,10 +54,62 @@ function newCandidates(){
   }
   return out;
 }
-function newLeftToday(){ const d = dayRec(); return Math.max(0, S.settings.dailyNew + (d.extraNew || 0) - d.newWords); }
+
+/* ---------- units: a new pack opens every day at noon (learn afternoon and evening, sleep, practice in the morning) ---------- */
+const UNIT_START = '2026-11-08';
+const TEST_EVERY = 3, BRAKE_ACC = 80, BRAKE_SIZE = 25, TEST_CHUNK = 20;
+// the cycle a moment belongs to is named by the date of the noon that opened it
+const cycleKey = (t = Date.now()) => new Date(t - 12*3600000).toLocaleDateString('en-CA');
+function quotaFor(key){
+  if (key <= '2026-12-12') return 30;
+  if (key <= '2026-12-16') return 15;
+  return 0;                                   // 17–19.12: reviews only
+}
+const nextNoon = () => { const d = new Date(); d.setHours(12,0,0,0); if (d <= new Date()) d.setDate(d.getDate()+1); return d; };
+function curUnit(){ return S.units[S.units.length - 1]; }
+const unitLeft = u => u ? u.words.filter(id => !S.cards[id]) : [];
+function rollUnits(){
+  if (!S.units){
+    // unit 0: every word learned before units existed
+    S.units = [{n:0, key:'start', words: Object.keys(S.cards).filter(id => byId[id] && byId[id].lvl !== 0)}];
+    S.tests = [];
+  }
+  const key = cycleKey();
+  if (key < UNIT_START) return;
+  const last = curUnit();
+  if (last.key === key) return;
+  // words of the last unit not started yet carry over to the new one, then new words fill it up to the day's size
+  const carry = last.n > 0 ? unitLeft(last) : [];
+  last.words = last.words.filter(id => S.cards[id]);
+  let size = quotaFor(key);
+  if (S.brake && size) size = Math.min(size, BRAKE_SIZE);
+  const words = carry.concat(newCandidates(Math.max(0, size - carry.length), carry));
+  const n = last.n + 1;
+  // a cumulative test opens together with units 4, 7, 10…: it covers every unit before it
+  if (n > 1 && (n - 1) % TEST_EVERY === 0) makeTest(n - 1);
+  S.units.push({n, key, opened: Date.now(), words, carry: carry.length});
+  save();
+}
+// words that passed 3 cumulative tests in a row are only sampled (about a third), so the tests stay a manageable size
+function makeTest(upTo){
+  if (S.tests.some(t => t.upTo === upTo)) return;
+  const ids = S.units.filter(u => u.n <= upTo).flatMap(u => u.words).filter(id => S.cards[id]);
+  const items = shuffle(ids.filter(id => (S.cards[id].tp || 0) < 3 || Math.random() < 1/3));
+  S.tests.push({upTo, opened: Date.now(), items, ans:{}});
+}
+const openTest = () => S.tests.find(t => !t.done);
+function testChunk(t){ return t.items.filter(id => !(id in t.ans)).slice(0, TEST_CHUNK).map(id => ({id, isNew:false})); }
+function finishTestIfDone(t){
+  if (t.done || t.items.some(id => !(id in t.ans))) return;
+  const v = Object.values(t.ans); t.done = Date.now();
+  t.acc = Math.round(100 * v.filter(Boolean).length / v.length);
+  S.brake = t.acc < BRAKE_ACC;               // below 80%: the next units shrink to 25 words until a test is back above it
+  save();
+}
+function newLeftToday(){ return unitLeft(curUnit()).length; }
 function buildSession(){
   const due = dueCards();
-  const fresh = newCandidates().slice(0, newLeftToday());
+  const fresh = unitLeft(curUnit());
   const ids = [];
   // reviews first, new words interleaved (1 new per 2 reviews)
   let di = 0, ni = 0;
@@ -82,6 +137,7 @@ const MAX_TIMED_MS = 60000;   // an answer over a minute (app left open) is not 
 // kind: 'normal' | 'practice' | 'check'. guessed: answered right but marked "ניחשתי".
 function grade(id, ok, ms, mode, kind = 'normal', guessed = false){
   const practice = kind === 'practice';
+  const tObj = kind === 'test' ? openTest() : null;
   if (!S.cards[id]){ const d = dayRec(); d.newWords++; (d.grps ||= []).push(...(GROUP_OF[id] || [])); }
   const c = S.cards[id] ||= {box:0, due:0, seen:0, right:0, wrong:0, learn:LEARN_NEW, first:Date.now()};
   c.learn ||= 0; c.fmt ||= {};
@@ -93,7 +149,7 @@ function grade(id, ok, ms, mode, kind = 'normal', guessed = false){
     // a guess never moves a word forward: in learning it needs the same number of correct answers again, in review it stays where it is
     if (c.learn > 0 || practice) c.due = Date.now();
     else c.due = Date.now() + 1*DAY - 3600000;
-  } else if (kind === 'check'){
+  } else if (kind === 'check' || kind === 'test'){
     // spot check of locked words: a miss sends the word back to learning, a correct answer leaves the schedule as is
     if (!ok){ c.box = 1; c.learn = LEARN_AFTER_MISS; c.due = Date.now(); }
   } else if (practice){
@@ -114,15 +170,21 @@ function grade(id, ok, ms, mode, kind = 'normal', guessed = false){
       c.due = Date.now() + Math.max(INTERVALS[c.box], 1)*DAY - 3600000;
     } else { c.box = 1; c.learn = LEARN_AFTER_MISS; c.due = Date.now(); }
   }
+  if (kind === 'test'){
+    // cumulative test: every answer is kept; 3 passes in a row and the word is only sampled in later tests
+    const t = tObj;
+    if (t && !(id in t.ans)){ t.ans[id] = (ok && !guessed) ? 1 : 0; finishTestIfDone(t); }
+    c.tp = (ok && !guessed) ? (c.tp || 0) + 1 : 0;
+  }
   c.last = Date.now();
   if (Date.now() < CAP && c.due > CAP) c.due = CAP;
   const d = dayRec(); d.reviews++; if (ok && !guessed) d.correct++;
   if (ms <= MAX_TIMED_MS){ d.ms += ms; d.timed = (d.timed ?? 0) + 1; }
   touchStreak();
-  const tag = kind === 'normal' ? '' : kind + '-';
+  const tag = kind === 'normal' ? '' : kind === 'test' ? `test${tObj ? tObj.upTo : ''}-` : kind + '-';
   S.queue.push({t:new Date().toISOString(), word:id, ok:(ok && !guessed)?1:0, ms, mode: tag + mode + (guessed ? '>guess' : ''), box:c.box, lvl:byId[id].lvl, dev:S.device});
   save();
-  return kind !== 'check' && (c.learn > 0 || guessed);   // true: show it again later in this session
+  return kind !== 'check' && kind !== 'test' && (c.learn > 0 || guessed);   // true: show it again later in this session
 }
 function practiceSet(){
   // words still settling (learned in the last days or not yet locked), weakest first
@@ -162,7 +224,7 @@ async function sync(force = false){
   const batch = S.queue.slice(0, 200);
   const st = stats();
   const payload = {events: batch, summary: {t: new Date().toISOString(), dev: S.device, mastered: st.mastered, learning: st.learning, total: st.total, acc7: st.acc7, avgMs: st.avgMs, streak: st.streak, due: st.due,
-    levels: st.levels.map(l => `${l.mastered}/${l.total}`).join(' · ')}};
+    levels: st.levels.map(l => `${l.mastered}/${l.total}`).join(' · ') + ` · unit ${curUnit()?.n ?? 0} left ${newLeftToday()}` + (S.tests?.length ? ` · tests ${S.tests.filter(x => x.done).map(x => x.upTo + ':' + x.acc + '%').join(',')}` : '')}};
   try{
     await fetch(url, {method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain'}, body: JSON.stringify(payload)});
     S.queue.splice(0, batch.length); S.lastSync = Date.now(); save(); syncState = 'ok';
@@ -177,7 +239,16 @@ const fmtPct = v => v == null ? '–' : v + '%';
 function shuffle(a){ for (let i = a.length-1; i > 0; i--){ const j = Math.floor(Math.random()*(i+1)); [a[i],a[j]] = [a[j],a[i]]; } return a; }
 
 function home(){
+  rollUnits();
   const st = stats();
+  const u = curUnit(), left = newLeftToday(), t = openTest();
+  const hrs = Math.max(1, Math.round((nextNoon() - Date.now()) / 3600000));
+  const unitLine = u.n === 0 ? `היחידה הראשונה נפתחת היום ב־12:00`
+    : !u.words.length ? `היום רק חזרות, בלי מילים חדשות · מתחזקים את מה שכבר יש`
+    : left ? `נשארו <b>${left}</b> מתוך ${u.words.length} מילים חדשות${u.carry ? ` (${u.carry} עברו מהיחידה הקודמת)` : ''} · יחידה חדשה בעוד ${hrs} ${hrs === 1 ? 'שעה' : 'שעות'}`
+    : `סיימת את כל ${u.words.length} המילים של היחידה · יחידה חדשה בעוד ${hrs} ${hrs === 1 ? 'שעה' : 'שעות'}`;
+  const tDone = t ? Object.keys(t.ans).length : 0;
+  const lastT = S.tests.filter(x => x.done).slice(-1)[0];
   const ses = buildSession();
   const examDays = Math.ceil((new Date('2026-12-20T08:00:00+02:00') - Date.now()) / DAY);
   const syncLine = !S.settings.syncUrl ? '<span class="sync muted">הסנכרון עוד לא מוגדר</span>'
@@ -186,7 +257,15 @@ function home(){
   app.innerHTML = `
     <div class="top"><h1>אמירנט</h1><button class="icon-btn" id="setBtn">הגדרות</button></div>
     <p class="muted">${examDays > 0 ? `עוד ${examDays} ימים לבחינה` : 'יום הבחינה'} · רצף של ${st.streak} ${st.streak === 1 ? 'יום' : 'ימים'}</p>
-    ${checkDue() ? '<button class="btn primary" id="checkBtn">בדיקת פתע שבועית · מילים נעולות</button>' : ''}
+    <section class="panel unit">
+      <div class="row" style="justify-content:space-between"><h2>${u.n === 0 ? 'יחידה 0' : 'יחידה ' + u.n}</h2>${S.brake ? '<span class="pill">25 מילים ביחידה · עד שהמבחן הבא יעבור 80%</span>' : ''}</div>
+      <p>${unitLine}</p>
+      ${u.words.length ? `<div class="bar"><span class="m" style="width:${100*(u.words.length-left)/u.words.length}%"></span></div>` : ''}
+      ${lastT ? `<p class="muted" style="font-size:14px">מבחן מצטבר אחרון (יחידות 0–${lastT.upTo}): ${lastT.acc}%</p>` : ''}
+    </section>
+    ${t ? `<button class="big-btn" id="testBtn" style="background:var(--ink);color:var(--paper)">מבחן מצטבר · יחידות 0–${t.upTo} · ${tDone}/${t.items.length}</button>
+      <p class="muted" style="font-size:14px;margin-top:-8px">אפשר לחלק ליומיים. כל פעם ${TEST_CHUNK} מילים, ההתקדמות נשמרת.</p>` : ''}
+    ${checkDue() && !t ? '<button class="btn primary" id="checkBtn">בדיקת פתע שבועית · מילים נעולות</button>' : ''}
     ${ses.length ? `<button class="big-btn" id="go">התחל · ${ses.length} מילים</button>` : '<p class="muted" id="doneNote">סיימת את מה שמתוכנן להיום. אפשר להמשיך:</p>'}
     <section class="panel">
       <div class="stats">
@@ -195,7 +274,7 @@ function home(){
         <div class="stat"><span class="n">${fmtPct(st.acc7)}</span><span class="l">דיוק, 7 ימים</span></div>
         <div class="stat"><span class="n">${st.avgMs ? (st.avgMs/1000).toFixed(1) : '–'}</span><span class="l">שניות לתשובה</span></div>
       </div>
-      <p class="muted" style="font-size:14px">לחזרה עכשיו: ${st.due} · מילים חדשות שנשארו היום: ${newLeftToday()}</p>
+      <p class="muted" style="font-size:14px">לחזרה עכשיו: ${st.due}</p>
     </section>
     <section class="panel">
       <h2>התקדמות לפי רמה</h2>
@@ -212,6 +291,7 @@ function home(){
   document.getElementById('listBtn').onclick = wordList;
   const sb = document.getElementById('stubBtn'); if (sb) sb.onclick = stubbornList;
   const cb = document.getElementById('checkBtn'); if (cb) cb.onclick = () => session(checkSet(), 'check');
+  const tb = document.getElementById('testBtn'); if (tb) tb.onclick = () => session(testChunk(t), 'test');
 }
 
 function session(items, kind = 'normal'){
@@ -230,14 +310,14 @@ function session(items, kind = 'normal'){
     const pick = a => a[Math.floor(Math.random() * a.length)];
     const missing = c ? missingFmts(id, c) : [];
     const ctxMode = () => pick(['cloze', 'ctx']);
-    const mode = kind === 'check' ? (CLOZES[id] ? ctxMode() : pick(['he2en', 'type']))
+    const mode = (kind === 'check' || kind === 'test') ? (CLOZES[id] ? ctxMode() : pick(kind === 'test' ? ['en2he', 'he2en', 'type'] : ['he2en', 'type']))
       : (isNew || !c) ? 'en2he'
       : (c.learn > 0 || c.box < 2) ? (c.seen % 2 ? 'he2en' : 'en2he')
       // from the second review on, a format the word has not passed yet is asked first
       : missing.length ? ({rec:'en2he', prod: c.box >= 3 ? pick(['he2en','type']) : 'he2en', ctx: ctxMode()})[pick(missing)]
       : (CLOZES[id] && Math.random() < 0.6) ? ctxMode()
       : (c.box >= 3 && Math.random() < 0.5) ? 'type' : (Math.random() < 0.5 ? 'en2he' : 'he2en');
-    if (mode === 'type') return typeCard(w, kind === 'check');
+    if (mode === 'type') return typeCard(w, kind === 'check' || kind === 'test');
     // distractors must not share a meaning word with the answer (e.g. "למרות" vs "למרות ש")
     const toks = s => s.split(/[\s,;]+/).filter(t => t.length >= 3);
     const wt = new Set(toks(w.he));
@@ -254,10 +334,11 @@ function session(items, kind = 'normal'){
       <div class="card">
         ${isNew ? '<span class="pill" style="justify-self:center">מילה חדשה</span>' : ''}
         ${kind === 'check' ? '<span class="pill" style="justify-self:center">בדיקת פתע</span>' : ''}
+        ${kind === 'test' ? '<span class="pill" style="justify-self:center">מבחן מצטבר</span>' : ''}
         ${mode === 'cloze' ? `<span class="pill" style="justify-self:center">השלמת משפט</span><div class="prompt-cloze">${esc(CLOZES[id]).replace('____', '<span class="blank">______</span>')}</div>`
           : mode === 'ctx' ? `<span class="pill" style="justify-self:center">מה המילה המודגשת אומרת כאן?</span><div class="prompt-cloze">${esc(CLOZES[id]).replace('____', '<b class="hl">' + esc(w.en) + '</b>')}</div>`
           : mode === 'en2he' ? `<div class="prompt-en">${esc(w.en)}</div>` : `<div class="prompt-he">${esc(w.he)}</div>`}
-        ${(mode === 'cloze' || mode === 'ctx' || kind === 'check') ? '' : `<div class="hint">${POS_NAMES[w.pos]}</div>`}
+        ${(mode === 'cloze' || mode === 'ctx' || kind === 'check' || kind === 'test') ? '' : `<div class="hint">${POS_NAMES[w.pos]}</div>`}
       </div>
       <div class="opts">${opts.map((o,k) => `<button class="opt ${(mode === 'en2he' || mode === 'ctx') ? '' : 'en'}" data-id="${esc(o.id)}"><span class="k">${k+1}</span><span>${esc((mode === 'en2he' || mode === 'ctx') ? o.he : o.en)}</span></button>`).join('')}
         <button class="opt idk" data-id="__idk__"><span class="k">?</span><span>לא יודע</span></button></div>
@@ -334,6 +415,7 @@ function session(items, kind = 'normal'){
     const ok = results.filter(Boolean).length;
     if (kind === 'check'){ S.lastCheck = Date.now(); save(); }
     sync();
+    if (kind === 'test') return testFinish(ok, results.length);
     app.innerHTML = `
       <div class="panel done">
         <h2>סשן הושלם</h2>
@@ -351,16 +433,35 @@ function session(items, kind = 'normal'){
   show();
 }
 
+function testFinish(ok, n){
+  const t = S.tests.slice().reverse().find(x => x.items.length && Object.keys(x.ans).length) || {};
+  const answered = Object.keys(t.ans || {}).length;
+  const missed = Object.entries(t.ans || {}).filter(([,v]) => !v).map(([id]) => id);
+  const fin = !!t.done;
+  app.innerHTML = `
+    <div class="panel done">
+      <h2>${fin ? 'המבחן המצטבר הושלם' : 'חלק מהמבחן הושלם'}</h2>
+      <div class="n">${fin ? t.acc + '%' : ok + '/' + n}</div>
+      <p class="muted">${fin ? (t.acc >= BRAKE_ACC ? 'עברת את רף ה־80%. ממשיכים במלוא הקצב.' : 'מתחת ל־80%. היחידות הבאות יהיו של 25 מילים עד שהמבחן הבא יעבור את הרף. זה לא צעד אחורה, זה מה שמחזיק את הקצב לאורך זמן.')
+        : `ענית על ${answered} מתוך ${t.items.length}. אפשר להמשיך עכשיו או מחר.`}</p>
+    </div>
+    ${missed.length ? `<section class="panel"><h2>מילים שטעית בהן · חוזרות ללמידה</h2><div class="list">${missed.map(id => `<div class="w"><span>${esc(byId[id].en)}</span><span>${esc(byId[id].he)}</span></div>`).join('')}</div></section>` : ''}
+    ${!fin ? '<button class="big-btn" id="more">עוד ' + TEST_CHUNK + ' מילים מהמבחן</button>' : ''}
+    <button class="btn" id="back">למסך הבית</button>`;
+  if (!fin) document.getElementById('more').onclick = () => session(testChunk(t), 'test');
+  document.getElementById('back').onclick = home;
+}
+
 // after the planned work: learn more new words, or practice words that are not locked yet
 function moreButtons(anchor){
   const wrap = document.createElement('div');
   wrap.style.cssText = 'display:grid;gap:10px';
-  const hasNew = newCandidates().length > 0;
+  const hasNew = curUnit().n > 0 && quotaFor(cycleKey()) > 0 && newCandidates(1).length > 0;
   const prac = practiceSet();
-  wrap.innerHTML = `${hasNew ? '<button class="big-btn" id="moreNew">עוד 10 מילים חדשות</button>' : ''}
+  wrap.innerHTML = `${hasNew ? '<button class="big-btn" id="moreNew">עוד 10 מילים · מקדימים את היחידה הבאה</button>' : ''}
     ${prac.length ? `<button class="btn" id="freePrac">תרגול חופשי · ${prac.length} מילים שעוד לא ננעלו</button>` : ''}`;
   anchor.after(wrap);
-  if (hasNew) wrap.querySelector('#moreNew').onclick = () => { const d = dayRec(); d.extraNew = (d.extraNew || 0) + 10; save(); session(buildSession()); };
+  if (hasNew) wrap.querySelector('#moreNew').onclick = () => { const u = curUnit(); u.words.push(...newCandidates(10, u.words)); save(); session(buildSession()); };
   if (prac.length) wrap.querySelector('#freePrac').onclick = () => session(prac, 'practice');
 }
 
@@ -390,8 +491,7 @@ function wordList(){
 function settings(){
   app.innerHTML = `<div class="top"><h1>הגדרות</h1><button class="icon-btn" id="back">חזרה</button></div>
     <section class="panel">
-      <label for="dn">מילים חדשות ביום</label>
-      <select id="dn">${[10,15,20,25,30,40].map(n => `<option ${n === S.settings.dailyNew ? 'selected' : ''}>${n}</option>`).join('')}</select>
+      <p class="muted">גודל היחידה נקבע לפי לוח הזמנים: 30 מילים עד 12.12, 15 עד 16.12, ומ־17.12 רק חזרות.</p>
       <label for="su">כתובת הסנכרון לגיליון</label>
       <input id="su" dir="ltr" placeholder="https://script.google.com/macros/s/.../exec" value="${esc(S.settings.syncUrl)}">
       <div class="row"><button class="btn primary" id="saveS">שמור</button><button class="btn" id="syncNow">סנכרן עכשיו</button></div>
@@ -404,7 +504,6 @@ function settings(){
     </section>`;
   document.getElementById('back').onclick = home;
   document.getElementById('saveS').onclick = () => {
-    S.settings.dailyNew = +document.getElementById('dn').value;
     S.settings.syncUrl = document.getElementById('su').value.trim();
     save(); document.getElementById('msg').textContent = 'נשמר';
   };
@@ -415,13 +514,13 @@ function settings(){
     await sync(true); m.textContent = syncState === 'ok' ? 'נשלח לגיליון' : 'השליחה נכשלה. בדוק את הכתובת והחיבור לרשת';
   };
   document.getElementById('copy').onclick = async () => {
-    const txt = JSON.stringify({cards:S.cards, days:S.days});
+    const txt = JSON.stringify({cards:S.cards, days:S.days, units:S.units, tests:S.tests});
     try { await navigator.clipboard.writeText(txt); document.getElementById('copy').textContent = 'הועתק'; }
     catch(e){ const t = document.createElement('textarea'); t.value = txt; t.style.height = '120px'; document.getElementById('copy').after(t); t.select(); }
   };
 }
 
-const APP_VERSION = 7;
+const APP_VERSION = 8;
 if ('serviceWorker' in navigator){
   // check for a new version on every open; when it takes over, reload once so the new files are used
   navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => r.update()).catch(() => {});
