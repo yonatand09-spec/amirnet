@@ -106,6 +106,13 @@ function finishTestIfDone(t){
   S.brake = t.acc < BRAKE_ACC;               // below 80%: the next units shrink to 25 words until a test is back above it
   save();
 }
+// v9 one-time fix: words learned under v8 got their first review 23 hours later (after the noon swap); move it to the next morning
+function migrateV9(){
+  if (S.v9) return;
+  const m = nextMorning();
+  Object.values(S.cards).forEach(c => { if (c.box === 1 && !(c.learn > 0) && c.due > m && c.due - Date.now() < 30*3600000) c.due = m; });
+  S.v9 = 1; save();
+}
 function newLeftToday(){ return unitLeft(curUnit()).length; }
 function buildSession(){
   const due = dueCards();
@@ -133,21 +140,23 @@ const FMT_OF = m => m.startsWith('en2he') ? 'rec' : (m.startsWith('he2en') || m.
 function needFmts(id){ return CLOZES[id] ? ['rec','prod','ctx'] : ['rec','prod']; }
 function missingFmts(id, c){ return needFmts(id).filter(f => !(c.fmt && c.fmt[f])); }
 function isLocked(id, c){ return c.box >= MASTERED_BOX && missingFmts(id, c).length === 0; }
-const MAX_TIMED_MS = 60000;   // an answer over a minute (app left open) is not counted in speed
+const MAX_TIMED_MS = 60000;
+function nextMorning(){ const d = new Date(); d.setHours(6,0,0,0); while (d.getTime() - Date.now() < 8*3600000) d.setDate(d.getDate()+1); return d.getTime(); }   // an answer over a minute (app left open) is not counted in speed
 // kind: 'normal' | 'practice' | 'check'. guessed: answered right but marked "ניחשתי".
 function grade(id, ok, ms, mode, kind = 'normal', guessed = false){
-  const practice = kind === 'practice';
+  const practice = kind === 'practice' || kind === 'unit';
   const tObj = kind === 'test' ? openTest() : null;
   if (!S.cards[id]){ const d = dayRec(); d.newWords++; (d.grps ||= []).push(...(GROUP_OF[id] || [])); }
   const c = S.cards[id] ||= {box:0, due:0, seen:0, right:0, wrong:0, learn:LEARN_NEW, first:Date.now()};
   c.learn ||= 0; c.fmt ||= {};
   const reviewing = c.learn === 0 && c.box >= 1;   // formats count only in reviews on later days, not in the first learning round
-  c.seen++; c.lastMs = ms;
+  c.seen++; c.lastMs = ms; c.lm = mode.split('>')[0];
   const SLOW_MS = mode.startsWith('type') ? 15000 : mode.startsWith('cloze') ? 20000 : 8000;
   if (ok && !guessed){ c.right++; const f = FMT_OF(mode); if (f && reviewing && !practice) c.fmt[f] = 1; } else if (!ok) c.wrong++;
   if (guessed){
     // a guess never moves a word forward: in learning it needs the same number of correct answers again, in review it stays where it is
-    if (c.learn > 0 || practice) c.due = Date.now();
+    if (kind === 'unit') {}                       // unit practice: a guess leaves the morning review where it is
+    else if (c.learn > 0 || practice) c.due = Date.now();
     else c.due = Date.now() + 1*DAY - 3600000;
   } else if (kind === 'check' || kind === 'test'){
     // spot check of locked words: a miss sends the word back to learning, a correct answer leaves the schedule as is
@@ -158,7 +167,7 @@ function grade(id, ok, ms, mode, kind = 'normal', guessed = false){
   } else if (c.learn > 0){
     if (ok){
       c.learn--;
-      if (c.learn === 0){ c.box = 1; c.due = Date.now() + INTERVALS[1]*DAY - 3600000; }   // learned: next check tomorrow
+      if (c.learn === 0){ c.box = 1; c.due = nextMorning(); }   // learned: first review the next morning, after sleep, before the unit changes at noon
       else c.due = Date.now();                                                         // still learning: comes back in this session
     } else { c.learn = Math.max(c.learn, LEARN_AFTER_MISS); c.due = Date.now(); }
   } else {
@@ -185,6 +194,14 @@ function grade(id, ok, ms, mode, kind = 'normal', guessed = false){
   S.queue.push({t:new Date().toISOString(), word:id, ok:(ok && !guessed)?1:0, ms, mode: tag + mode + (guessed ? '>guess' : ''), box:c.box, lvl:byId[id].lvl, dev:S.device});
   save();
   return kind !== 'check' && kind !== 'test' && (c.learn > 0 || guessed);   // true: show it again later in this session
+}
+// the current unit's words, weakest first, then mixed: practice until the unit changes at noon
+function unitPracticeSet(){
+  const u = curUnit(); if (!u || u.n === 0) return [];
+  const ids = u.words.filter(id => S.cards[id]);
+  // least recently asked first, so two rounds cover the whole unit; inside a round the weakest come first
+  const weak = id => { const c = S.cards[id]; return (c.right + 1) / (c.seen + 2); };
+  return ids.sort((a,b) => (S.cards[a].last || 0) - (S.cards[b].last || 0)).slice(0, 15).sort((a,b) => weak(a) - weak(b)).map(id => ({id, isNew:false}));
 }
 function practiceSet(){
   // words still settling (learned in the last days or not yet locked), weakest first
@@ -239,7 +256,7 @@ const fmtPct = v => v == null ? '–' : v + '%';
 function shuffle(a){ for (let i = a.length-1; i > 0; i--){ const j = Math.floor(Math.random()*(i+1)); [a[i],a[j]] = [a[j],a[i]]; } return a; }
 
 function home(){
-  rollUnits();
+  rollUnits(); migrateV9();
   const st = stats();
   const u = curUnit(), left = newLeftToday(), t = openTest();
   const hrs = Math.max(1, Math.round((nextNoon() - Date.now()) / 3600000));
@@ -296,7 +313,7 @@ function home(){
 
 function session(items, kind = 'normal'){
   if (kind === true) kind = 'practice';
-  const practice = kind === 'practice';
+  const practice = kind === 'practice' || kind === 'unit';
   const results = [];
   let i = 0, alive = true;   // alive turns false when the user leaves, so a pending timer never draws a card over the home screen
   const show = () => {
@@ -310,9 +327,15 @@ function session(items, kind = 'normal'){
     const pick = a => a[Math.floor(Math.random() * a.length)];
     const missing = c ? missingFmts(id, c) : [];
     const ctxMode = () => pick(['cloze', 'ctx']);
+    // every format the word can be asked in, minus the one it was asked in last time
+    const varied = () => { const all = ['en2he', 'he2en', 'type'].concat(CLOZES[id] ? ['cloze', 'ctx'] : []); const f = all.filter(m => !c || m !== c.lm); return pick(f.length ? f : all); };
     const mode = (kind === 'check' || kind === 'test') ? (CLOZES[id] ? ctxMode() : pick(kind === 'test' ? ['en2he', 'he2en', 'type'] : ['he2en', 'type']))
+      : kind === 'unit' ? varied()
       : (isNew || !c) ? 'en2he'
-      : (c.learn > 0 || c.box < 2) ? (c.seen % 2 ? 'he2en' : 'en2he')
+      // learning round: recognise, then produce, then use it in a sentence (or write it when there is no sentence)
+      : c.learn > 0 ? (c.learn >= 3 ? 'en2he' : c.learn === 2 ? 'he2en' : (CLOZES[id] ? ctxMode() : 'type'))
+      // first review, the morning after: any format, different from the last one
+      : c.box < 2 ? varied()
       // from the second review on, a format the word has not passed yet is asked first
       : missing.length ? ({rec:'en2he', prod: c.box >= 3 ? pick(['he2en','type']) : 'he2en', ctx: ctxMode()})[pick(missing)]
       : (CLOZES[id] && Math.random() < 0.6) ? ctxMode()
@@ -424,10 +447,10 @@ function session(items, kind = 'normal'){
       </div>
       <button class="big-btn" id="again">עוד סשן</button>
       <button class="btn" id="back">למסך הבית</button>`;
-    const next = buildSession();
+    const next = kind === 'unit' && !buildSession().length ? unitPracticeSet() : buildSession();
     const again = document.getElementById('again');
     if (!next.length){ again.remove(); moreButtons(document.getElementById('back')); }
-    else again.onclick = () => session(next);
+    else again.onclick = () => session(next, kind === 'unit' && !buildSession().length ? 'unit' : 'normal');
     document.getElementById('back').onclick = home;
   };
   show();
@@ -456,12 +479,13 @@ function testFinish(ok, n){
 function moreButtons(anchor){
   const wrap = document.createElement('div');
   wrap.style.cssText = 'display:grid;gap:10px';
-  const hasNew = curUnit().n > 0 && quotaFor(cycleKey()) > 0 && newCandidates(1).length > 0;
+  const uw = unitPracticeSet();
   const prac = practiceSet();
-  wrap.innerHTML = `${hasNew ? '<button class="big-btn" id="moreNew">עוד 10 מילים · מקדימים את היחידה הבאה</button>' : ''}
-    ${prac.length ? `<button class="btn" id="freePrac">תרגול חופשי · ${prac.length} מילים שעוד לא ננעלו</button>` : ''}`;
+  wrap.innerHTML = `${uw.length ? `<button class="big-btn" id="unitPrac">תרגול היחידה · ${uw.length} מילים</button>
+      <p class="muted" style="font-size:14px">כל סבב בסוגי שאלות אחרים. אפשר לחזור על זה כמה שרוצים עד שהיחידה מתחלפת בצהריים.</p>` : ''}
+    ${prac.length ? `<button class="btn" id="freePrac">תרגול חופשי · מילים שעוד לא ננעלו מכל היחידות</button>` : ''}`;
   anchor.after(wrap);
-  if (hasNew) wrap.querySelector('#moreNew').onclick = () => { const u = curUnit(); u.words.push(...newCandidates(10, u.words)); save(); session(buildSession()); };
+  if (uw.length) wrap.querySelector('#unitPrac').onclick = () => session(unitPracticeSet(), 'unit');
   if (prac.length) wrap.querySelector('#freePrac').onclick = () => session(prac, 'practice');
 }
 
@@ -520,7 +544,7 @@ function settings(){
   };
 }
 
-const APP_VERSION = 8;
+const APP_VERSION = 9;
 if ('serviceWorker' in navigator){
   // check for a new version on every open; when it takes over, reload once so the new files are used
   navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => r.update()).catch(() => {});
