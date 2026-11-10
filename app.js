@@ -351,6 +351,10 @@ function session(items, kind = 'normal'){
     const distract = shuffle(far.length >= 3 ? far : pool).slice(0, 3);
     const opts = shuffle([w, ...distract]);
     const t0 = performance.now();
+    // recall first: a known word is shown alone; the options appear only after you say whether you recalled it.
+    // "לא נזכרתי" + a right pick counts like a guess, so recognising an option never passes for knowing the word
+    const recallStep = !isNew && !!c && kind !== 'test' && kind !== 'check';
+    let recalled = null;
     app.innerHTML = `
       <div class="top"><button class="icon-btn" id="quit">יציאה</button><span class="muted">${i+1}/${items.length}</span></div>
       <div class="progress">${items.map((_,k) => `<i class="${k < i ? (results[k] ? 'ok' : 'no') : k === i ? 'cur' : ''}"></i>`).join('')}</div>
@@ -363,10 +367,17 @@ function session(items, kind = 'normal'){
           : mode === 'en2he' ? `<div class="prompt-en">${esc(w.en)}</div>` : `<div class="prompt-he">${esc(w.he)}</div>`}
         ${(mode === 'cloze' || mode === 'ctx' || kind === 'check' || kind === 'test') ? '' : `<div class="hint">${POS_NAMES[w.pos]}</div>`}
       </div>
-      <div class="opts">${opts.map((o,k) => `<button class="opt ${(mode === 'en2he' || mode === 'ctx') ? '' : 'en'}" data-id="${esc(o.id)}"><span class="k">${k+1}</span><span>${esc((mode === 'en2he' || mode === 'ctx') ? o.he : o.en)}</span></button>`).join('')}
+      ${recallStep ? `<div class="recall" id="rc"><p class="muted" style="text-align:center">נסה להיזכר לפני שאתה רואה אפשרויות</p>
+        <div class="row" style="justify-content:center"><button class="btn primary" id="rcy">נזכרתי</button><button class="btn" id="rcn">לא נזכרתי</button></div></div>` : ''}
+      <div class="opts" id="opts" ${recallStep ? 'hidden' : ''}>${opts.map((o,k) => `<button class="opt ${(mode === 'en2he' || mode === 'ctx') ? '' : 'en'}" data-id="${esc(o.id)}"><span class="k">${k+1}</span><span>${esc((mode === 'en2he' || mode === 'ctx') ? o.he : o.en)}</span></button>`).join('')}
         <button class="opt idk" data-id="__idk__"><span class="k">?</span><span>לא יודע</span></button></div>
       <div class="feedback" id="fb"></div>`;
     document.getElementById('quit').onclick = () => { alive = false; sync(); home(); };
+    if (recallStep){
+      const reveal = yes => { recalled = yes; document.getElementById('rc').remove(); document.getElementById('opts').hidden = false; };
+      document.getElementById('rcy').onclick = () => reveal(true);
+      document.getElementById('rcn').onclick = () => reveal(false);
+    }
     app.querySelectorAll('.opt').forEach(b => b.onclick = () => {
       const ms = Math.round(performance.now() - t0);
       const ok = b.dataset.id === id;   // "לא יודע" counts as a miss, so a lucky guess never locks a word
@@ -374,7 +385,9 @@ function session(items, kind = 'normal'){
       if (!ok && b.dataset.id !== '__idk__') b.classList.add('wrong');
       // a wrong pick is logged with the word it was confused with
       const picked = ok ? mode : mode + '>' + (b.dataset.id === '__idk__' ? 'idk' : b.dataset.id);
-      if (!ok){ requeue(id, grade(id, false, ms, picked, kind), false); results.push(false); after(w, false); return; }
+      if (!ok){ requeue(id, grade(id, false, ms, picked + (recalled === true ? '>claimed' : ''), kind), false); results.push(false); after(w, false); return; }
+      // right pick without recalling first: shown as correct, graded as a guess
+      if (recalled === false){ requeue(id, grade(id, true, ms, picked + '>norecall', kind, true), false); results.push(false); after(w, true); return; }
       // a correct answer is graded when the card moves on, so "ניחשתי" can still change it
       after(w, true, guessed => { requeue(id, grade(id, true, ms, picked, kind, guessed), !guessed); results.push(!guessed); });
     });
@@ -544,7 +557,7 @@ function settings(){
   };
 }
 
-const APP_VERSION = 9;
+const APP_VERSION = 10;
 if ('serviceWorker' in navigator){
   // check for a new version on every open; when it takes over, reload once so the new files are used
   navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => r.update()).catch(() => {});
